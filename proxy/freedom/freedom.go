@@ -112,7 +112,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	output := link.Writer
 
 	var conn internet.Connection
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+	if err := retry.ExponentialBackoff(5, 100).On(func() error {
 		dialDest := destination
 		if h.config.useIP() && dialDest.Address.Family().IsDomain() {
 			ip := h.resolveIP(ctx, dialDest.Address.Domain(), dialer.Address())
@@ -122,7 +122,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					Address: ip,
 					Port:    dialDest.Port,
 				}
-				newError("dialing to to ", dialDest).WriteToLog(session.ExportIDToError(ctx))
+				newError("dialing to ", dialDest).WriteToLog(session.ExportIDToError(ctx))
 			}
 		}
 
@@ -132,8 +132,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 		conn = rawConn
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return newError("failed to open connection to ", destination).Base(err)
 	}
 	defer conn.Close()
@@ -184,7 +183,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 func NewPacketReader(conn net.Conn) buf.Reader {
 	iConn := conn
-	statConn, ok := iConn.(*internet.StatCouterConnection)
+	statConn, ok := iConn.(*internet.StatCounterConnection)
 	if ok {
 		iConn = statConn.Connection
 	}
@@ -228,7 +227,7 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 func NewPacketWriter(conn net.Conn, h *Handler, ctx context.Context) buf.Writer {
 	iConn := conn
-	statConn, ok := iConn.(*internet.StatCouterConnection)
+	statConn, ok := iConn.(*internet.StatCounterConnection)
 	if ok {
 		iConn = statConn.Connection
 	}

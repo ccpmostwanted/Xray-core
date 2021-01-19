@@ -48,6 +48,7 @@ func ListenUnix(ctx context.Context, address net.Address, settings *MemoryStream
 	}
 	return listener, nil
 }
+
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, settings *MemoryStreamConfig, handler ConnHandler) (Listener, error) {
 	if settings == nil {
 		s, err := ToMemoryStreamConfig(nil)

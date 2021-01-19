@@ -1,0 +1,31 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "port": 10801,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "5422b403-c1ee-463c-a3c0-104599582286",
+            "level": 0,
+            "email": "love@example.com"
+          }
+        ],
+        "mux": true,
+        "decryption": "none",
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
+    }
+  ]
+}

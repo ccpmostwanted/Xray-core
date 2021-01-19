@@ -79,13 +79,16 @@ func (w *tcpWorker) callback(conn internet.Connection) {
 		}
 	}
 
+	// Wrap connection in StatCounterConnection
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
-		conn = &internet.StatCouterConnection{
+		conn = &internet.StatCounterConnection{
 			Connection:   conn,
 			ReadCounter:  w.uplinkCounter,
 			WriteCounter: w.downlinkCounter,
 		}
 	}
+
+	// Set inbound session in context
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{
 		Source:  net.DestinationFromAddr(conn.RemoteAddr()),
 		Gateway: net.TCPDestination(w.address, w.port),
@@ -93,6 +96,7 @@ func (w *tcpWorker) callback(conn internet.Connection) {
 		Conn:    conn,
 	})
 
+	// Set content session in context
 	content := new(session.Content)
 	if w.sniffingConfig != nil {
 		content.SniffingRequest.Enabled = w.sniffingConfig.Enabled
@@ -100,13 +104,13 @@ func (w *tcpWorker) callback(conn internet.Connection) {
 	}
 	ctx = session.ContextWithContent(ctx, content)
 
+	// Hand over the request to proxy
 	if err := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher); err != nil {
 		newError("connection ends").Base(err).WriteToLog(session.ExportIDToError(ctx))
 	}
+
+	// Cancel context and clean up if the connection is not mux connection
 	cancel()
-	if err := conn.Close(); err != nil {
-		newError("failed to close connection").Base(err).WriteToLog(session.ExportIDToError(ctx))
-	}
 }
 
 func (w *tcpWorker) Proxy() proxy.Inbound {
@@ -432,7 +436,7 @@ func (w *dsWorker) callback(conn internet.Connection) {
 	ctx = session.ContextWithID(ctx, sid)
 
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
-		conn = &internet.StatCouterConnection{
+		conn = &internet.StatCounterConnection{
 			Connection:   conn,
 			ReadCounter:  w.uplinkCounter,
 			WriteCounter: w.downlinkCounter,

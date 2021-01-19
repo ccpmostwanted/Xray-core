@@ -7,7 +7,6 @@ import (
 	"time"
 
 	goxtls "github.com/xtls/go"
-
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
@@ -18,19 +17,19 @@ import (
 
 // Listener is an internet.Listener that listens for TCP connections.
 type Listener struct {
-	listener   net.Listener
-	tlsConfig  *gotls.Config
-	xtlsConfig *goxtls.Config
-	authConfig internet.ConnectionAuthenticator
-	config     *Config
-	addConn    internet.ConnHandler
-	locker     *internet.FileLocker // for unix domain socket
+	listener    net.Listener
+	tlsConfig   *gotls.Config
+	xtlsConfig  *goxtls.Config
+	authConfig  internet.ConnectionAuthenticator
+	config      *Config
+	connHandler internet.ConnHandler
+	locker      *internet.FileLocker // for unix domain socket
 }
 
 // ListenTCP creates a new Listener based on configurations.
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
 	l := &Listener{
-		addConn: handler,
+		connHandler: handler,
 	}
 	tcpSettings := streamSettings.ProtocolSettings.(*Config)
 	l.config = tcpSettings
@@ -119,7 +118,7 @@ func (v *Listener) keepAccepting() {
 			conn = v.authConfig.Server(conn)
 		}
 
-		v.addConn(internet.Connection(conn))
+		v.connHandler(internet.Connection(conn))
 	}
 }
 

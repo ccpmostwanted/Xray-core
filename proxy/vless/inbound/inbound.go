@@ -4,6 +4,7 @@ package inbound
 
 import (
 	"context"
+	"github.com/xtaci/smux"
 	"io"
 	"strconv"
 	"strings"
@@ -66,6 +67,7 @@ type Handler struct {
 	dns                   dns.Client
 	fallbacks             map[string]map[string]map[string]*Fallback // or nil
 	// regexps               map[string]*regexp.Regexp       // or nil
+	muxEnabled bool
 }
 
 // New creates a new VLess inbound handler.
@@ -76,6 +78,7 @@ func New(ctx context.Context, config *Config, dc dns.Client) (*Handler, error) {
 		policyManager:         v.GetFeature(policy.ManagerType()).(policy.Manager),
 		validator:             new(vless.Validator),
 		dns:                   dc,
+		muxEnabled:            config.Mux,
 	}
 
 	for _, user := range config.Clients {
@@ -145,12 +148,75 @@ func (*Handler) Network() []net.Network {
 	return []net.Network{net.Network_TCP, net.Network_UNIX}
 }
 
-// Process implements proxy.Inbound.Process().
 func (h *Handler) Process(ctx context.Context, network net.Network, connection internet.Connection, dispatcher routing.Dispatcher) error {
+	// Handle mux connection if mux is enabled
+	if h.muxEnabled {
+		muxSession, err := smux.Server(connection, nil)
+		if err != nil {
+			return newError("failed to establish mux connection with the client").Base(err)
+		}
+
+		if err != nil {
+			return newError("failed to establish mux connection with the client").Base(err)
+		}
+
+		newError("a new mux connection coming in").AtInfo()
+
+		inbound := session.InboundFromContext(ctx)
+		content := session.ContentFromContext(ctx)
+
+		go h.ProcessMux(network, connection, muxSession, dispatcher, inbound, content)
+
+		return nil
+	}
+
+	// Handle VLESS request when mux is disabled
+	processError := h.ProcessVless(ctx, network, connection, dispatcher)
+	if err := connection.Close(); err != nil {
+		newError("failed to close connection").Base(err).WriteToLog(session.ExportIDToError(ctx))
+	}
+	return processError
+}
+
+func (h *Handler) ProcessMux(network net.Network, connection internet.Connection,
+	muxSession *smux.Session, dispatcher routing.Dispatcher, inbound *session.Inbound,
+	content *session.Content) {
+
+	defer muxSession.Close()
+	defer connection.Close()
+
+	ctx := context.Background()
+	ctx = session.ContextWithInbound(ctx, inbound)
+	ctx = session.ContextWithContent(ctx, content)
+
+	for {
+		// Wait for new stream
+		stream, err := muxSession.AcceptStream()
+		if err != nil {
+			newError("mux connection terminated").Base(err).AtInfo().WriteToLog()
+			break
+		}
+
+		sid := session.ExportIDToError(ctx)
+		newError("received new mux stream").Base(err).AtInfo().WriteToLog(sid)
+
+		// Assign new session id
+		ctx = session.ContextWithID(ctx, session.NewID())
+
+		// Process the request
+		go h.ProcessVless(ctx, network, stream, dispatcher)
+		//if e != nil {
+		//	newError("error processing VLESS request").Base(err).AtError().WriteToLog()
+		//	break
+		//}
+	}
+}
+
+func (h *Handler) ProcessVless(ctx context.Context, network net.Network, connection internet.Connection, dispatcher routing.Dispatcher) error {
 	sid := session.ExportIDToError(ctx)
 
 	iConn := connection
-	statConn, ok := iConn.(*internet.StatCouterConnection)
+	statConn, ok := iConn.(*internet.StatCounterConnection)
 	if ok {
 		iConn = statConn.Connection
 	}
@@ -175,8 +241,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 	var requestAddons *encoding.Addons
 	var err error
 
-	apfb := h.fallbacks
-	isfb := apfb != nil
+	napfb := h.fallbacks
+	isfb := napfb != nil
 
 	if isfb && firstLen < 18 {
 		err = newError("fallback directly")
@@ -193,36 +259,44 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 
 			name := ""
 			alpn := ""
-			if len(apfb) > 1 || apfb[""] == nil {
-				if tlsConn, ok := iConn.(*tls.Conn); ok {
-					name = tlsConn.ConnectionState().ServerName
-					alpn = tlsConn.ConnectionState().NegotiatedProtocol
-					newError("realServerName = " + name).AtInfo().WriteToLog(sid)
-					newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
-				} else if xtlsConn, ok := iConn.(*xtls.Conn); ok {
-					name = xtlsConn.ConnectionState().ServerName
-					alpn = xtlsConn.ConnectionState().NegotiatedProtocol
-					newError("realServerName = " + name).AtInfo().WriteToLog(sid)
-					newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
-				}
-				labels := strings.Split(name, ".")
-				for i := range labels {
-					labels[i] = "*"
-					candidate := strings.Join(labels, ".")
-					if apfb[candidate] != nil {
-						name = candidate
-						break
-					}
-				}
-				if apfb[name] == nil {
-					name = ""
-				}
-				if apfb[name][alpn] == nil {
-					alpn = ""
-				}
-
+			if tlsConn, ok := iConn.(*tls.Conn); ok {
+				cs := tlsConn.ConnectionState()
+				name = cs.ServerName
+				alpn = cs.NegotiatedProtocol
+				newError("realName = " + name).AtInfo().WriteToLog(sid)
+				newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
+			} else if xtlsConn, ok := iConn.(*xtls.Conn); ok {
+				cs := xtlsConn.ConnectionState()
+				name = cs.ServerName
+				alpn = cs.NegotiatedProtocol
+				newError("realName = " + name).AtInfo().WriteToLog(sid)
+				newError("realAlpn = " + alpn).AtInfo().WriteToLog(sid)
 			}
-			pfb := apfb[name][alpn]
+
+			if len(napfb) > 1 || napfb[""] == nil {
+				if name != "" && napfb[name] == nil {
+					match := ""
+					for n := range napfb {
+						if n != "" && strings.Contains(name, n) && len(n) > len(match) {
+							match = n
+						}
+					}
+					name = match
+				}
+			}
+
+			if napfb[name] == nil {
+				name = ""
+			}
+			apfb := napfb[name]
+			if apfb == nil {
+				return newError(`failed to find the default "name" config`).AtWarning()
+			}
+
+			if apfb[alpn] == nil {
+				alpn = ""
+			}
+			pfb := apfb[alpn]
 			if pfb == nil {
 				return newError(`failed to find the default "alpn" config`).AtWarning()
 			}

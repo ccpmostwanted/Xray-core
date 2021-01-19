@@ -48,6 +48,7 @@ type Handler struct {
 	serverList    *protocol.ServerList
 	serverPicker  protocol.ServerPicker
 	policyManager policy.Manager
+	muxManager    SmuxManager
 }
 
 // New creates a new VLess outbound handler.
@@ -66,6 +67,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		serverList:    serverList,
 		serverPicker:  protocol.NewRoundRobinServerPicker(serverList),
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+		muxManager:    NewSmuxManager(),
 	}
 
 	return handler, nil
@@ -78,22 +80,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	if err := retry.ExponentialBackoff(5, 200).On(func() error {
 		rec = h.serverPicker.PickServer()
-		var err error
-		conn, err = dialer.Dial(ctx, rec.Destination())
-		if err != nil {
-			return err
+		if rec.HasMux() {
+			c, e := h.muxManager.getConnection(ctx, rec.Destination(), dialer)
+			if e != nil {
+				return newError("failed to establish mux connection with the server").Base(e).AtError()
+			}
+			conn = c
 		}
 		return nil
 	}); err != nil {
 		return newError("failed to find an available destination").Base(err).AtWarning()
 	}
 	defer conn.Close()
-
-	iConn := conn
-	statConn, ok := iConn.(*internet.StatCouterConnection)
-	if ok {
-		iConn = statConn.Connection
-	}
 
 	outbound := session.OutboundFromContext(ctx)
 	if outbound == nil || !outbound.Target.IsValid() {
@@ -103,18 +101,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	target := outbound.Target
 	newError("tunneling request to ", target, " via ", rec.Destination()).AtInfo().WriteToLog(session.ExportIDToError(ctx))
 
-	command := protocol.RequestCommandTCP
-	if target.Network == net.Network_UDP {
-		command = protocol.RequestCommandUDP
-	}
-	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
-		command = protocol.RequestCommandMux
-	}
-
 	request := &protocol.RequestHeader{
 		Version: encoding.Version,
 		User:    rec.PickUser(),
-		Command: command,
+		Command: h.setCommand(target),
 		Address: target.Address,
 		Port:    target.Port,
 	}
@@ -144,7 +134,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			requestAddons.Flow = ""
 		case protocol.RequestCommandTCP:
-			if xtlsConn, ok := iConn.(*xtls.Conn); ok {
+			if xtlsConn, ok := conn.(*xtls.Conn); ok {
 				xtlsConn.RPRX = true
 				xtlsConn.SHOW = xtls_show
 				xtlsConn.MARK = "XTLS"
@@ -163,7 +153,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 	default:
-		if _, ok := iConn.(*xtls.Conn); ok {
+		if _, ok := conn.(*xtls.Conn); ok {
 			panic(`To avoid misunderstanding, you must fill in VLESS "flow" when using XTLS.`)
 		}
 	}
@@ -219,12 +209,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		if rawConn != nil {
 			var counter stats.Counter
-			if statConn != nil {
-				counter = statConn.ReadCounter
-			}
-			err = encoding.ReadV(serverReader, clientWriter, timer, iConn.(*xtls.Conn), rawConn, counter, sctx)
+			err = encoding.ReadV(serverReader, clientWriter, timer, conn.(*xtls.Conn), rawConn, counter, sctx)
 		} else {
-			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBufer
+			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer
 			err = buf.Copy(serverReader, clientWriter, buf.UpdateActivity(timer))
 		}
 
@@ -240,4 +227,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	return nil
+}
+
+func (h *Handler) setCommand(target net.Destination) protocol.RequestCommand {
+	command := protocol.RequestCommandTCP
+
+	if target.Network == net.Network_UDP {
+		command = protocol.RequestCommandUDP
+	}
+
+	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
+		command = protocol.RequestCommandMux
+	}
+
+	return command
 }
